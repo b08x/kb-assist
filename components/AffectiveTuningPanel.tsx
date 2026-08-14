@@ -10,10 +10,12 @@ import {
   Sparkles, 
   Info,
   Layers,
-  FileText
+  FileText,
+  Zap,
+  CheckCircle2
 } from 'lucide-react';
 import { AffectiveTelemetry } from '../types';
-import { AFFECTIVE_PRESETS, DEFAULT_AFFECTIVE_TELEMETRY } from '../utils/affectiveTelemetry';
+import { AFFECTIVE_PRESETS, DEFAULT_AFFECTIVE_TELEMETRY, getAffectivePromptDirective } from '../utils/affectiveTelemetry';
 
 interface AffectiveTuningPanelProps {
   telemetry: AffectiveTelemetry;
