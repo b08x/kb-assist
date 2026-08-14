@@ -119,3 +119,12 @@ export interface UnifiedMessage {
   role: 'system' | 'user' | 'assistant';
   content: string;
 }
+
+export interface AffectiveTelemetry {
+  toneAuthority: number;      // 0-100, default 50
+  emotionalPolarity: number;  // 0-100, default 50
+  abstractionLevel: number;    // 0-100, default 50
+  proceduralAssertiveness: number; // 0-100, default 50
+  enabled: boolean;             // Master toggle, default true
+  activePreset?: string;      // Optional: 'End User', 'Technician', 'IT Staff', 'Custom'
+}

@@ -15,7 +15,8 @@ import {
   GenerationParams, 
   FileAttachment, 
   ProviderSyncState,
-  ModelInfo
+  ModelInfo,
+  AffectiveTelemetry
 } from './types';
 import { 
   INITIAL_PLACEHOLDERS, 
@@ -25,6 +26,12 @@ import {
 } from './constants';
 import { generateId, convertToMarkdown } from './utils';
 import { exportToDocx } from './utils/docExport';
+import { 
+  loadAffectiveTelemetry, 
+  saveAffectiveTelemetry, 
+  appendAffectiveContext,
+  getAffectivePromptDirective
+} from './utils/affectiveTelemetry';
 import { 
   loadModelCache, 
   saveModelCache, 
@@ -42,6 +49,8 @@ import SideDrawer from './components/SideDrawer';
 import SettingsModal from './components/SettingsModal';
 import VariantsModal from './components/VariantsModal';
 import ModelSelector from './components/ModelSelector';
+import AffectiveTuningPanel from './components/AffectiveTuningPanel';
+import LivePromptPreview from './components/LivePromptPreview';
 import { 
   CodeIcon, 
   SparklesIcon, 
@@ -173,6 +182,10 @@ function App() {
   const [componentVariations, setComponentVariations] = useState<ComponentVariation[]>([]);
   const [pendingPrompt, setPendingPrompt] = useState<string>('');
 
+  // Affective Telemetry Console State
+  const [affectiveTelemetry, setAffectiveTelemetry] = useState<AffectiveTelemetry>(loadAffectiveTelemetry);
+  const [activeSidebarTab, setActiveSidebarTab] = useState<'affective' | 'history' | 'preview'>('affective');
+
   const inputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const exportRef = useRef<HTMLDivElement>(null);
@@ -180,6 +193,14 @@ function App() {
   useEffect(() => {
     inputRef.current?.focus();
   }, []);
+
+  // Persist Affective Telemetry state
+  useEffect(() => {
+    const activeDocId = currentSessionIndex >= 0 && sessions[currentSessionIndex] && focusedArtifactIndex !== null
+      ? sessions[currentSessionIndex].artifacts[focusedArtifactIndex]?.id
+      : undefined;
+    saveAffectiveTelemetry(affectiveTelemetry, activeDocId);
+  }, [affectiveTelemetry, currentSessionIndex, sessions, focusedArtifactIndex]);
 
   // Fetch secrets status on mount
   useEffect(() => {
@@ -483,7 +504,7 @@ Output the COMPLETE updated HTML document starting with <!DOCTYPE html>.
         activeProvider,
         activeModel,
         {
-          system: KB_EDIT_SYSTEM_INSTRUCTION,
+          system: appendAffectiveContext(KB_EDIT_SYSTEM_INSTRUCTION, affectiveTelemetry),
           user: userParts
         },
         genParams,
@@ -517,6 +538,204 @@ Output the COMPLETE updated HTML document starting with <!DOCTYPE html>.
           : sess
       ));
     } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleApplyAffectiveTuning = async (options: {
+    scope: 'selection' | 'document' | 'all';
+    targetArtifact?: Artifact;
+    selectedText?: string;
+    telemetryOverride?: AffectiveTelemetry;
+  }) => {
+    if (isLoading) return;
+    const activeSession = sessions[currentSessionIndex];
+    if (!activeSession) return;
+
+    const telemetryToApply = options.telemetryOverride || affectiveTelemetry;
+    if (!telemetryToApply.enabled) return;
+
+    setIsLoading(true);
+
+    const directive = getAffectivePromptDirective(telemetryToApply);
+
+    if (options.scope === 'selection') {
+      // Partial tuning: rewrite selected text/element with current affective tone
+      if (focusedArtifactIndex === null || !options.selectedText) {
+        setIsLoading(false);
+        return;
+      }
+      const targetArtifact = activeSession.artifacts[focusedArtifactIndex];
+      const refinementPrompt = `Please restyle and rewrite ONLY the following selected excerpt to conform precisely to the affective telemetry directives below, while preserving the exact technical facts, terms, code blocks, and context:\n\n[SELECTED EXCERPT TO TUNE]:\n"""\n${options.selectedText}\n"""\n\n${directive}\n\nUpdate the document accordingly and return the COMPLETE updated HTML document starting with <!DOCTYPE html>.`;
+      
+      setIsLoading(false);
+      await handleTargetedEdit(refinementPrompt);
+      return;
+    }
+
+    if (options.scope === 'document') {
+      // Tune single document
+      const target = options.targetArtifact || (focusedArtifactIndex !== null ? activeSession.artifacts[focusedArtifactIndex] : null);
+      if (!target) {
+        setIsLoading(false);
+        return;
+      }
+      const targetIndex = activeSession.artifacts.findIndex(a => a.id === target.id);
+      if (targetIndex === -1) {
+        setIsLoading(false);
+        return;
+      }
+
+      const sessionId = generateId();
+      const newArtifacts: Artifact[] = activeSession.artifacts.map((art, i) => 
+        i === targetIndex ? { ...art, id: `${sessionId}_${i}`, status: 'streaming' as const } : { ...art, id: `${sessionId}_${i}` }
+      );
+
+      const documentTunePrompt = `Apply the following Affective Telemetry tuning to the entire document while keeping all technical accuracy, architecture diagrams, command syntax, and structure intact:\n\n${directive}\n\nOutput the COMPLETE updated HTML document starting with <!DOCTYPE html>.`;
+
+      const { userParts } = buildContext(activeSession, target, documentTunePrompt);
+      const newUserMessage: Message = { 
+        id: generateId(), 
+        role: 'user', 
+        parts: [{ text: `Applied Affective Tuning (${telemetryToApply.activePreset || 'Custom'}) to ${target.styleName}` }], 
+        timestamp: Date.now() 
+      };
+
+      const newSession: Session = { 
+        ...activeSession, 
+        id: sessionId, 
+        artifacts: newArtifacts, 
+        messages: [...activeSession.messages, newUserMessage], 
+        activeArtifactId: newArtifacts[targetIndex].id 
+      };
+
+      setSessions(prev => [...prev, newSession]);
+      setCurrentSessionIndex(sessions.length);
+
+      const apiKey = customKeys[activeProvider];
+      let accumulated = '';
+
+      try {
+        await streamGeneration(
+          activeProvider,
+          activeModel,
+          {
+            system: appendAffectiveContext(KB_EDIT_SYSTEM_INSTRUCTION, telemetryToApply),
+            user: userParts
+          },
+          genParams,
+          apiKey,
+          (chunk) => {
+            accumulated += chunk;
+            const processedHtml = cleanHtml(accumulated);
+            setSessions(prev => prev.map(sess => 
+              sess.id === sessionId 
+                ? { ...sess, artifacts: sess.artifacts.map(a => a.id === newArtifacts[targetIndex].id ? { ...a, html: processedHtml } : a) } 
+                : sess
+            ));
+          }
+        );
+
+        const finalHtml = cleanHtml(accumulated);
+        const finalModelMessage: Message = { 
+          id: generateId(), 
+          role: 'model', 
+          parts: [{ text: `Document "${target.styleName}" updated with affective tuning coordinates.` }], 
+          timestamp: Date.now() 
+        };
+
+        setSessions(prev => prev.map(sess => 
+          sess.id === sessionId 
+            ? { 
+                ...sess, 
+                messages: [...sess.messages, finalModelMessage], 
+                artifacts: sess.artifacts.map(a => a.id === newArtifacts[targetIndex].id ? { ...a, status: 'complete' as const, html: finalHtml } : a) 
+              } 
+            : sess
+        ));
+      } catch (e: any) {
+        setSessions(prev => prev.map(sess => 
+          sess.id === sessionId 
+            ? { ...sess, artifacts: sess.artifacts.map(a => a.id === newArtifacts[targetIndex].id ? { ...a, status: 'error' as const, error: e.message, provider: activeProvider, modelId: activeModel, html: `<p>Error: ${e.message}</p>` } : a) } 
+            : sess
+        ));
+      } finally {
+        setIsLoading(false);
+      }
+      return;
+    }
+
+    if (options.scope === 'all') {
+      // Tune all documents in the session simultaneously
+      const sessionId = generateId();
+      const newArtifacts: Artifact[] = activeSession.artifacts.map((art, i) => ({
+        ...art,
+        id: `${sessionId}_${i}`,
+        status: 'streaming' as const
+      }));
+
+      const newSession: Session = {
+        ...activeSession,
+        id: sessionId,
+        artifacts: newArtifacts,
+        messages: [
+          ...activeSession.messages,
+          {
+            id: generateId(),
+            role: 'user',
+            parts: [{ text: `Applied Affective Tuning (${telemetryToApply.activePreset || 'Custom'}) across all documents in workspace.` }],
+            timestamp: Date.now()
+          }
+        ]
+      };
+
+      setSessions(prev => [...prev, newSession]);
+      setCurrentSessionIndex(sessions.length);
+
+      const apiKey = customKeys[activeProvider];
+
+      await Promise.all(activeSession.artifacts.map(async (artifact, i) => {
+        await wait(i * 200);
+        let accumulated = '';
+        const docTunePrompt = `Apply the following Affective Telemetry tuning to the entire document while keeping all technical accuracy, markdown formatting, and design intact:\n\n${directive}\n\nOutput the COMPLETE updated HTML document starting with <!DOCTYPE html>.`;
+        const { userParts } = buildContext(activeSession, artifact, docTunePrompt);
+
+        try {
+          await streamGeneration(
+            activeProvider,
+            activeModel,
+            {
+              system: appendAffectiveContext(KB_EDIT_SYSTEM_INSTRUCTION, telemetryToApply),
+              user: userParts
+            },
+            genParams,
+            apiKey,
+            (chunk) => {
+              accumulated += chunk;
+              const processedHtml = cleanHtml(accumulated);
+              setSessions(prev => prev.map(sess => 
+                sess.id === sessionId 
+                  ? { ...sess, artifacts: sess.artifacts.map(a => a.id === newArtifacts[i].id ? { ...a, html: processedHtml } : a) } 
+                  : sess
+              ));
+            }
+          );
+
+          const finalCleaned = cleanHtml(accumulated);
+          setSessions(prev => prev.map(sess => 
+            sess.id === sessionId 
+              ? { ...sess, artifacts: sess.artifacts.map(a => a.id === newArtifacts[i].id ? { ...a, status: 'complete' as const, html: finalCleaned } : a) } 
+              : sess
+          ));
+        } catch (e: any) {
+          setSessions(prev => prev.map(sess => 
+            sess.id === sessionId 
+              ? { ...sess, artifacts: sess.artifacts.map(a => a.id === newArtifacts[i].id ? { ...a, status: 'error', error: e.message, provider: activeProvider, modelId: activeModel, html: `<p>Error: ${e.message}</p>` } : a) } 
+              : sess
+          ));
+        }
+      }));
+
       setIsLoading(false);
     }
   };
@@ -563,7 +782,7 @@ Output the COMPLETE updated HTML document starting with <!DOCTYPE html>.
         providerToUse,
         modelToUse,
         {
-          system: instruction,
+          system: appendAffectiveContext(instruction, affectiveTelemetry),
           user: userParts
         },
         genParams,
@@ -678,7 +897,7 @@ Output complete standard HTML starting with <!DOCTYPE html>.
           activeProvider,
           activeModel,
           {
-            system: instruction,
+            system: appendAffectiveContext(instruction, affectiveTelemetry),
             user: userParts
           },
           genParams,
@@ -753,7 +972,7 @@ Output complete standard HTML starting with <!DOCTYPE html>.
             activeProvider,
             activeModel,
             {
-              system: instructions[i],
+              system: appendAffectiveContext(instructions[i], affectiveTelemetry),
               user: userParts
             },
             genParams,
@@ -1046,13 +1265,59 @@ Output complete standard HTML starting with <!DOCTYPE html>.
                     onRetry={() => handleRetryArtifact(artifact)}
                     onSwitchToGemini={() => handleSwitchToGemini(artifact)}
                     onOpenSettings={() => setIsSettingsOpen(true)}
+                    affectiveTelemetry={affectiveTelemetry}
+                    onApplyAffectiveTuning={handleApplyAffectiveTuning}
+                    isApplyingTuning={isLoading}
                   />
                 ))}
               </div>
               {focusedArtifactIndex !== null && sIndex === currentSessionIndex && (
                 <div className="focus-chat-panel">
-                  <div className="focus-chat-header">Conversation History</div>
-                  <ChatLog messages={session.messages} onUndo={handleUndo} canUndo={currentSessionIndex > 0} />
+                  <div className="focus-sidebar-header-tabs">
+                    <button 
+                      type="button"
+                      className={`focus-sidebar-tab ${activeSidebarTab === 'affective' ? 'active' : ''}`}
+                      onClick={() => setActiveSidebarTab('affective')}
+                      title="Affective Tuning Console"
+                    >
+                      <Sliders size={13} /> AFFECTIVE TUNING
+                    </button>
+                    <button 
+                      type="button"
+                      className={`focus-sidebar-tab ${activeSidebarTab === 'history' ? 'active' : ''}`}
+                      onClick={() => setActiveSidebarTab('history')}
+                      title="Conversation History"
+                    >
+                      <RotateCcw size={13} /> CONVERSATION ({session.messages.length})
+                    </button>
+                    <button 
+                      type="button"
+                      className={`focus-sidebar-tab ${activeSidebarTab === 'preview' ? 'active' : ''}`}
+                      onClick={() => setActiveSidebarTab('preview')}
+                      title="Live Prompt Preview"
+                    >
+                      <FileCode size={13} /> PROMPT PREVIEW
+                    </button>
+                  </div>
+                  {activeSidebarTab === 'affective' && (
+                    <AffectiveTuningPanel 
+                      telemetry={affectiveTelemetry}
+                      onChange={(newTelemetry) => setAffectiveTelemetry(newTelemetry)}
+                      activeDocumentTitle={session.artifacts[focusedArtifactIndex]?.styleName}
+                      onApplyToDocument={(tel) => handleApplyAffectiveTuning({ scope: 'document', telemetryOverride: tel })}
+                      onApplyToAllDocuments={(tel) => handleApplyAffectiveTuning({ scope: 'all', telemetryOverride: tel })}
+                      isApplying={isLoading}
+                    />
+                  )}
+                  {activeSidebarTab === 'history' && (
+                    <ChatLog messages={session.messages} onUndo={handleUndo} canUndo={currentSessionIndex > 0} />
+                  )}
+                  {activeSidebarTab === 'preview' && (
+                    <LivePromptPreview 
+                      telemetry={affectiveTelemetry}
+                      activeDocumentTitle={session.artifacts[focusedArtifactIndex]?.styleName}
+                    />
+                  )}
                 </div>
               )}
             </div>
@@ -1066,6 +1331,14 @@ Output complete standard HTML starting with <!DOCTYPE html>.
               ? `Refining: ${currentSession?.artifacts[focusedArtifactIndex]?.styleName}` 
               : `Workspace: ${currentSession?.prompt}`}
           </div>
+
+          {affectiveTelemetry.enabled && (
+            <div className="affective-context-pill" title="Active Affective Telemetry Vector">
+              <span className="pill-dot" />
+              <span>Valence: {affectiveTelemetry.toneAuthority} | Trajectory: {affectiveTelemetry.abstractionLevel}</span>
+            </div>
+          )}
+
           <div className="action-buttons-wrapper">
             <div className="action-buttons">
               <div className="btn-group">

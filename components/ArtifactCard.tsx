@@ -5,7 +5,7 @@
 */
 
 import React, { useMemo, useCallback } from 'react';
-import { Artifact, AIProvider } from '../types';
+import { Artifact, AIProvider, AffectiveTelemetry } from '../types';
 import Editor from './Editor';
 import { AlertTriangle, RotateCcw, Sparkles, Settings } from 'lucide-react';
 
@@ -18,6 +18,9 @@ interface ArtifactCardProps {
     onRetry?: (artifact: Artifact) => void;
     onSwitchToGemini?: () => void;
     onOpenSettings?: () => void;
+    affectiveTelemetry?: AffectiveTelemetry;
+    onApplyAffectiveTuning?: (options: { scope: 'selection' | 'all'; selectedText?: string; selectedHtml?: string }) => Promise<void> | void;
+    isApplyingTuning?: boolean;
 }
 
 const ArtifactCard = React.memo(({ 
@@ -28,7 +31,10 @@ const ArtifactCard = React.memo(({
     onUpdate,
     onRetry,
     onSwitchToGemini,
-    onOpenSettings
+    onOpenSettings,
+    affectiveTelemetry,
+    onApplyAffectiveTuning,
+    isApplyingTuning
 }: ArtifactCardProps) => {
     const isBlurring = artifact.status === 'streaming';
     const isError = artifact.status === 'error';
@@ -132,6 +138,9 @@ const ArtifactCard = React.memo(({
                     <Editor 
                         content={bodyContent} 
                         onUpdate={handleEditUpdate} 
+                        affectiveTelemetry={affectiveTelemetry}
+                        onApplyAffectiveTuning={onApplyAffectiveTuning}
+                        isApplyingTuning={isApplyingTuning}
                     />
                 ) : (
                     <iframe 
